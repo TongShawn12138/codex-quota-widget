@@ -215,6 +215,17 @@ private struct UsageWidgetView: View {
 }
 
 @main
+struct QuotaWidgetBundle: WidgetBundle {
+    var body: some Widget {
+        UsageWidget()
+#if QUOTA_LIVE_ACTIVITY
+        if #available(macOS 27.3, *) {
+            QuotaLiveActivity()
+        }
+#endif
+    }
+}
+
 struct UsageWidget: Widget {
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: UsageStore.widgetKind, provider: UsageProvider()) { entry in
