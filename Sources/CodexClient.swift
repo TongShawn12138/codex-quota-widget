@@ -3,6 +3,41 @@ import Foundation
 
 enum CodexClient {
     static func read() throws -> UsageSnapshot {
+        let executable = try cliExecutable()
+        return try read(
+            from: executable,
+            arguments: ["app-server", "--stdio", "-c", "analytics.enabled=false"]
+        )
+    }
+
+    static func readWorkProgress() -> QuotaWorkProgress? {
+        let cloud = try? readCloudWork()
+        let local = UsageStore.readLocalWork()
+        guard local != nil || cloud != nil else { return nil }
+        return QuotaWorkProgress(tasks: (local ?? []) + (cloud ?? []), checkedAt: Date())
+    }
+
+    private static func readCloudWork() throws -> [QuotaWorkTask] {
+        let executable = try cliExecutable()
+        let files = FileManager.default
+        let workingDirectory = files.temporaryDirectory.appending(path: "quota-cloud-\(UUID().uuidString)")
+        // The experimental cloud command writes diagnostics to its working directory.
+        try files.createDirectory(at: workingDirectory, withIntermediateDirectories: false, attributes: [
+            .posixPermissions: 0o700
+        ])
+        defer { try? files.removeItem(at: workingDirectory) }
+        return try withProcess(
+            from: executable,
+            arguments: ["cloud", "list", "--json", "--limit", "20", "-c", "analytics.enabled=false"],
+            workingDirectory: workingDirectory
+        ) { writer, responses in
+            try writer.close()
+            let tasks: CloudTasks = try responses.readJSON(within: 8)
+            return tasks.pendingTasks
+        }
+    }
+
+    private static func cliExecutable() throws -> URL {
         let bundledCLI = "Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
         let home = FileManager.default.homeDirectoryForCurrentUser
         let candidates = [
@@ -16,24 +51,46 @@ enum CodexClient {
             throw ClientError.cliUnavailable
         }
 
-        // The proxy connects to the existing daemon without starting or changing it.
-        let executable = URL(fileURLWithPath: cli)
-        if let snapshot = try? read(from: executable, arguments: ["app-server", "proxy"]) {
-            return snapshot
-        }
-        return try read(
-            from: executable,
-            arguments: ["app-server", "--stdio", "-c", "analytics.enabled=false"]
-        )
+        return URL(fileURLWithPath: cli)
     }
 
     private static func read(from executable: URL, arguments: [String]) throws -> UsageSnapshot {
+        try appServer(from: executable, arguments: arguments) { writer, responses in
+            try send(["method": "account/rateLimits/read", "id": 2], to: writer)
+            let limits: RateLimits = try responses.wait(for: 2, within: 10)
+            return UsageSnapshot(fetchedAt: Date(), shared: true, buckets: limits.validBuckets)
+        }
+    }
+
+    private static func appServer<Result>(
+        from executable: URL,
+        arguments: [String],
+        _ request: (FileHandle, inout Responses) throws -> Result
+    ) throws -> Result {
+        try withProcess(from: executable, arguments: arguments) { writer, responses in
+            try send([
+                "method": "initialize",
+                "id": 1,
+                "params": ["clientInfo": ["name": "local_usage_widget", "version": "1.0"]]
+            ], to: writer)
+            let _: Empty = try responses.wait(for: 1, within: 3)
+            try send(["method": "initialized", "params": [:]], to: writer)
+            return try request(writer, &responses)
+        }
+    }
+
+    private static func withProcess<Result>(
+        from executable: URL,
+        arguments: [String],
+        workingDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        _ request: (FileHandle, inout Responses) throws -> Result
+    ) throws -> Result {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
         process.executableURL = executable
         process.arguments = arguments
-        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        process.currentDirectoryURL = workingDirectory
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
@@ -57,16 +114,7 @@ enum CodexClient {
         }
 
         var responses = Responses(fileDescriptor: reader.fileDescriptor)
-        try send([
-            "method": "initialize",
-            "id": 1,
-            "params": ["clientInfo": ["name": "local_usage_widget", "version": "1.0"]]
-        ], to: writer)
-        let _: Empty = try responses.wait(for: 1, within: 3)
-        try send(["method": "initialized", "params": [:]], to: writer)
-        try send(["method": "account/rateLimits/read", "id": 2], to: writer)
-        let limits: RateLimits = try responses.wait(for: 2, within: 10)
-        return UsageSnapshot(fetchedAt: Date(), shared: true, buckets: limits.validBuckets)
+        return try request(writer, &responses)
     }
 
     private static func send(_ message: [String: Any], to writer: FileHandle) throws {
@@ -127,8 +175,16 @@ enum CodexClient {
             throw ClientError.timeout
         }
 
+        mutating func readJSON<Result: Decodable>(within seconds: Double) throws -> Result {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            while let chunk = try readChunk(before: deadline) {
+                buffer.append(chunk)
+                guard buffer.count <= 1_048_576 else { throw ClientError.response }
+            }
+            return try decoder.decode(Result.self, from: buffer)
+        }
+
         private mutating func nextLine(before deadline: TimeInterval) throws -> Data {
-            var chunk = [UInt8](repeating: 0, count: 8_192)
             while true {
                 if let newline = buffer.firstIndex(of: 10) {
                     let line = Data(buffer[..<newline])
@@ -136,7 +192,14 @@ enum CodexClient {
                     return line
                 }
                 guard buffer.count <= 1_048_576 else { throw ClientError.response }
+                guard let chunk = try readChunk(before: deadline) else { throw ClientError.connection }
+                buffer.append(chunk)
+            }
+        }
 
+        private func readChunk(before deadline: TimeInterval) throws -> Data? {
+            var chunk = [UInt8](repeating: 0, count: 8_192)
+            while true {
                 let remaining = deadline - ProcessInfo.processInfo.systemUptime
                 guard remaining > 0 else { throw ClientError.timeout }
                 var descriptor = pollfd(fd: fileDescriptor, events: Int16(POLLIN), revents: 0)
@@ -147,8 +210,8 @@ enum CodexClient {
 
                 let count = chunk.withUnsafeMutableBytes { Darwin.read(fileDescriptor, $0.baseAddress, $0.count) }
                 if count < 0 && errno == EINTR { continue }
-                guard count > 0 else { throw ClientError.connection }
-                buffer.append(contentsOf: chunk.prefix(count))
+                guard count >= 0 else { throw ClientError.connection }
+                return count == 0 ? nil : Data(chunk.prefix(count))
             }
         }
     }
@@ -168,6 +231,31 @@ enum CodexClient {
     }
 
     private struct Empty: Decodable {}
+
+    private struct CloudTasks: Decodable {
+        let tasks: [Task]
+
+        var pendingTasks: [QuotaWorkTask] {
+            tasks.compactMap { task in
+                guard task.status?.lowercased() == "pending" else { return nil }
+                let title = task.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return QuotaWorkTask(
+                    title: title.isEmpty ? "Codex 云端任务" : String(title.prefix(100)),
+                    status: "云端待完成",
+                    completedSteps: nil,
+                    totalSteps: nil,
+                    currentStep: nil,
+                    completedToolCalls: nil,
+                    startedAt: nil
+                )
+            }
+        }
+
+        struct Task: Decodable {
+            let title: String?
+            let status: String?
+        }
+    }
 
     private struct RateLimits: Decodable {
         let rateLimits: Bucket?

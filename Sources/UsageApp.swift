@@ -11,6 +11,18 @@ final class UsageMonitor: ObservableObject {
     @Published private(set) var syncError: String?
     @Published private(set) var loginError: String?
     @Published private(set) var loginStatus = SMAppService.mainApp.status
+#if QUOTA_LIVE_ACTIVITY
+    static let followsChatGPTKey = "ShowQuotaWhileChatGPTRuns"
+    @Published var followsChatGPT = UserDefaults.standard.bool(forKey: followsChatGPTKey)
+    @Published var isChatGPTRunning = false
+    @Published var quotaActivityError: String?
+    var isReconcilingQuotaActivity = false
+    var quotaActivityDismissedForSession = false
+    var observedQuotaActivityID: String?
+    var quotaActivityObservation: Task<Void, Never>?
+    var quotaWorkObservation: Task<Void, Never>?
+    var quotaWorkProgress: QuotaWorkProgress?
+#endif
 
     func refresh() async {
         guard !isRefreshing else { return }
@@ -30,6 +42,15 @@ final class UsageMonitor: ObservableObject {
                     > 2 * UsageStore.refreshInterval {
                 WidgetCenter.shared.reloadTimelines(ofKind: UsageStore.widgetKind)
             }
+#if QUOTA_LIVE_ACTIVITY
+            if #available(macOS 27.3, *) {
+                if observedQuotaActivityID == nil {
+                    await reconcileQuotaActivity()
+                } else {
+                    await updateQuotaActivity(using: updated)
+                }
+            }
+#endif
         } catch {
             syncError = (error as? LocalizedError)?.errorDescription ?? "暂时无法同步额度。"
         }
@@ -144,6 +165,21 @@ private struct UsageOverview: View {
                 .disabled(monitor.isRefreshing)
                 Link("打开官方用量页面", destination: UsageStore.dashboardURL)
             }
+#if QUOTA_LIVE_ACTIVITY
+            if #available(macOS 27.3, *) {
+                Toggle("ChatGPT 运行时在灵动岛显示", isOn: Binding(
+                    get: { monitor.followsChatGPT },
+                    set: { monitor.setFollowsChatGPT($0) }
+                ))
+                if let error = monitor.quotaActivityError {
+                    Text(error).font(.callout).foregroundStyle(.secondary)
+                } else if monitor.followsChatGPT && !monitor.isChatGPTRunning {
+                    Text("等待 ChatGPT 打开")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+#endif
             Toggle("登录后自动同步", isOn: Binding(
                 get: { monitor.loginStatus == .enabled || monitor.loginStatus == .requiresApproval },
                 set: { monitor.setLaunchAtLogin($0) }
@@ -164,6 +200,9 @@ final class UsageApp: NSObject, NSApplicationDelegate {
     private let monitor = UsageMonitor()
     private var window: NSWindow?
     private var timer: Timer?
+#if QUOTA_LIVE_ACTIVITY
+    private var chatGPTObservation: NSKeyValueObservation?
+#endif
 
     static func main() {
         let app = NSApplication.shared
@@ -174,6 +213,15 @@ final class UsageApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+#if QUOTA_LIVE_ACTIVITY
+        if #available(macOS 27.3, *) {
+            chatGPTObservation = NSWorkspace.shared.observe(\.runningApplications, options: [.new]) {
+                [weak self] _, _ in
+                Task { @MainActor in self?.updateChatGPTPresence() }
+            }
+            updateChatGPTPresence(retry: true)
+        }
+#endif
         Task { await monitor.refresh() }
         timer = Timer.scheduledTimer(withTimeInterval: UsageStore.refreshInterval, repeats: true) {
             [weak self] _ in
@@ -192,6 +240,11 @@ final class UsageApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func didWake() {
+#if QUOTA_LIVE_ACTIVITY
+        if #available(macOS 27.3, *) {
+            updateChatGPTPresence(retry: true)
+        }
+#endif
         let lastUpdate = monitor.snapshot?.fetchedAt ?? .distantPast
         if Date().timeIntervalSince(lastUpdate) >= UsageStore.refreshInterval {
             Task { await monitor.refresh() }
@@ -200,6 +253,45 @@ final class UsageApp: NSObject, NSApplicationDelegate {
 
     func applicationDidBecomeActive(_ notification: Notification) {
         monitor.updateLoginStatus()
+#if QUOTA_LIVE_ACTIVITY
+        if #available(macOS 27.3, *) {
+            updateChatGPTPresence(retry: true)
+        }
+#endif
+    }
+
+#if QUOTA_LIVE_ACTIVITY
+    @available(macOS 27.3, *)
+    private func updateChatGPTPresence(retry: Bool = false) {
+        let isRunning = NSWorkspace.shared.runningApplications.contains { app in
+            guard !app.isTerminated else { return false }
+            return app.bundleIdentifier == "com.openai.chat" ||
+                (app.bundleIdentifier == "com.openai.codex" &&
+                    app.bundleURL?.lastPathComponent == "ChatGPT.app")
+        }
+        if monitor.isChatGPTRunning != isRunning {
+            monitor.quotaActivityDismissedForSession = false
+            monitor.isChatGPTRunning = isRunning
+        } else if !retry {
+            return
+        }
+        Task { await monitor.reconcileQuotaActivity() }
+    }
+#endif
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+#if QUOTA_LIVE_ACTIVITY
+        if #available(macOS 27.3, *) {
+            chatGPTObservation?.invalidate()
+            monitor.isChatGPTRunning = false
+            Task {
+                await monitor.endQuotaActivities()
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
+        }
+#endif
+        return .terminateNow
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
