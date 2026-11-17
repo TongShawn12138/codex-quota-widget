@@ -1,0 +1,214 @@
+import Darwin
+import Foundation
+
+enum CodexClient {
+    static func read() throws -> UsageSnapshot {
+        let bundledCLI = "Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            "/" + bundledCLI,
+            home.appending(path: bundledCLI).path,
+            home.appending(path: ".local/bin/codex").path,
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex"
+        ]
+        guard let cli = candidates.first(where: FileManager.default.isExecutableFile(atPath:)) else {
+            throw ClientError.cliUnavailable
+        }
+
+        // The proxy connects to the existing daemon without starting or changing it.
+        let executable = URL(fileURLWithPath: cli)
+        if let snapshot = try? read(from: executable, arguments: ["app-server", "proxy"]) {
+            return snapshot
+        }
+        return try read(
+            from: executable,
+            arguments: ["app-server", "--stdio", "-c", "analytics.enabled=false"]
+        )
+    }
+
+    private static func read(from executable: URL, arguments: [String]) throws -> UsageSnapshot {
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        let writer = input.fileHandleForWriting
+        let reader = output.fileHandleForReading
+        guard fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
+            throw ClientError.connection
+        }
+        do {
+            try process.run()
+        } catch {
+            throw ClientError.connection
+        }
+        defer {
+            try? writer.close()
+            try? reader.close()
+            if process.isRunning {
+                process.terminate()
+            }
+        }
+
+        var responses = Responses(fileDescriptor: reader.fileDescriptor)
+        try send([
+            "method": "initialize",
+            "id": 1,
+            "params": ["clientInfo": ["name": "local_usage_widget", "version": "1.0"]]
+        ], to: writer)
+        let _: Empty = try responses.wait(for: 1, within: 3)
+        try send(["method": "initialized", "params": [:]], to: writer)
+        try send(["method": "account/rateLimits/read", "id": 2], to: writer)
+        let limits: RateLimits = try responses.wait(for: 2, within: 10)
+        return UsageSnapshot(fetchedAt: Date(), shared: true, buckets: limits.validBuckets)
+    }
+
+    private static func send(_ message: [String: Any], to writer: FileHandle) throws {
+        var line = try JSONSerialization.data(withJSONObject: message)
+        line.append(10)
+        do {
+            try writer.write(contentsOf: line)
+        } catch {
+            throw ClientError.connection
+        }
+    }
+
+    private enum ClientError: LocalizedError {
+        case cliUnavailable
+        case connection
+        case response
+        case signInRequired
+        case timeout
+
+        var errorDescription: String? {
+            switch self {
+            case .cliUnavailable: "找不到 Codex 命令行。请确认 ChatGPT 桌面应用已安装。"
+            case .connection: "无法连接本机的 Codex 服务。"
+            case .response: "Codex 暂时无法提供额度，请稍后重试。"
+            case .signInRequired: "请先在 Codex 命令行使用 ChatGPT 帐号登录。"
+            case .timeout: "同步额度超时，请稍后重试。"
+            }
+        }
+    }
+
+    private struct Responses {
+        let fileDescriptor: Int32
+        private var buffer = Data()
+        private let decoder = JSONDecoder()
+
+        init(fileDescriptor: Int32) {
+            self.fileDescriptor = fileDescriptor
+        }
+
+        mutating func wait<Result: Decodable>(for id: Int, within seconds: Double) throws -> Result {
+            let deadline = ProcessInfo.processInfo.systemUptime + seconds
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                let line = try nextLine(before: deadline)
+                guard let header = try? decoder.decode(ResponseHeader.self, from: line),
+                      header.id == id, header.method == nil else { continue }
+                if let message = header.error?.message.lowercased() {
+                    let signInMessages = [
+                        "requires chatgpt", "requires a chatgpt", "not authenticated", "not logged in", "unauthorized"
+                    ]
+                    throw signInMessages.contains(where: message.contains)
+                        ? ClientError.signInRequired : ClientError.response
+                }
+                guard let response = try? decoder.decode(Response<Result>.self, from: line) else {
+                    throw ClientError.response
+                }
+                return response.result
+            }
+            throw ClientError.timeout
+        }
+
+        private mutating func nextLine(before deadline: TimeInterval) throws -> Data {
+            var chunk = [UInt8](repeating: 0, count: 8_192)
+            while true {
+                if let newline = buffer.firstIndex(of: 10) {
+                    let line = Data(buffer[..<newline])
+                    buffer.removeSubrange(...newline)
+                    return line
+                }
+                guard buffer.count <= 1_048_576 else { throw ClientError.response }
+
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { throw ClientError.timeout }
+                var descriptor = pollfd(fd: fileDescriptor, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&descriptor, 1, Int32((remaining * 1_000).rounded(.up)))
+                if ready == 0 { throw ClientError.timeout }
+                if ready < 0 && errno == EINTR { continue }
+                guard ready > 0 else { throw ClientError.connection }
+
+                let count = chunk.withUnsafeMutableBytes { Darwin.read(fileDescriptor, $0.baseAddress, $0.count) }
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw ClientError.connection }
+                buffer.append(contentsOf: chunk.prefix(count))
+            }
+        }
+    }
+
+    private struct ResponseHeader: Decodable {
+        struct Failure: Decodable {
+            let message: String
+        }
+
+        let id: Int?
+        let method: String?
+        let error: Failure?
+    }
+
+    private struct Response<Result: Decodable>: Decodable {
+        let result: Result
+    }
+
+    private struct Empty: Decodable {}
+
+    private struct RateLimits: Decodable {
+        let rateLimits: Bucket?
+        let rateLimitsByLimitId: KnownBuckets?
+
+        var validBuckets: [UsageBucket] {
+            let legacyID = rateLimits?.limitId ?? "codex"
+            let legacyCodex = legacyID == "codex" ? rateLimits : nil
+            guard let bucket = rateLimitsByLimitId?.codex ?? legacyCodex else { return [] }
+            let windows = [
+                bucket.primary?.usageWindow(id: "primary"),
+                bucket.secondary?.usageWindow(id: "secondary")
+            ].compactMap { $0 }
+            guard !windows.isEmpty else { return [] }
+            return [UsageBucket(id: "codex", name: "Codex", windows: windows)]
+        }
+
+        struct KnownBuckets: Decodable {
+            let codex: Bucket?
+        }
+
+        struct Bucket: Decodable {
+            let limitId: String?
+            let primary: Window?
+            let secondary: Window?
+        }
+
+        struct Window: Decodable {
+            let usedPercent: Double?
+            let windowDurationMins: Int?
+            let resetsAt: TimeInterval?
+
+            func usageWindow(id: String) -> UsageWindow? {
+                guard let usedPercent, usedPercent.isFinite else { return nil }
+                return UsageWindow(
+                    id: id,
+                    minutes: windowDurationMins,
+                    usedPercent: min(100, max(0, usedPercent)),
+                    resetsAt: resetsAt.map(Date.init(timeIntervalSince1970:))
+                )
+            }
+        }
+    }
+}
