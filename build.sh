@@ -41,16 +41,28 @@ for bundle in "$staged_app" "$widget_path"; do
 done
 
 sdk_path=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
+sdk_version=$(/usr/bin/xcrun --sdk macosx --show-sdk-version)
 target="$(/usr/bin/uname -m)-apple-macosx26.0"
 swift_options=(-sdk "$sdk_path" -target "$target" -parse-as-library -O -module-cache-path "$staging_dir/modules")
+if /usr/bin/awk -F. '{ exit !($1 > 27 || ($1 == 27 && $2 >= 3)) }' <<< "$sdk_version"; then
+    swift_options+=(-D QUOTA_LIVE_ACTIVITY)
+    /usr/bin/plutil -insert NSSupportsLiveActivities -bool true "$staged_app/Contents/Info.plist"
+elif [[ ${QUOTA_REQUIRE_LIVE_ACTIVITY:-0} == 1 ]]; then
+    printf 'Native Live Activities require the macOS 27.3 SDK or later. Found %s.\n' "$sdk_version" >&2
+    exit 1
+fi
 
 /usr/bin/xcrun swiftc "${swift_options[@]}" -module-name OpenAIUsage \
     "$source_dir/UsageApp.swift" "$source_dir/CodexClient.swift" "$source_dir/UsageStore.swift" \
+    "$source_dir/QuotaActivityAttributes.swift" "$source_dir/QuotaActivityController.swift" \
+    "$source_dir/QuotaWorkProgress.swift" \
     -o "$staged_app/Contents/MacOS/OpenAIUsage"
 
 /usr/bin/xcrun swiftc "${swift_options[@]}" -application-extension -module-name OpenAIUsageWidget \
     -Xlinker -e -Xlinker _NSExtensionMain -Xlinker -u -Xlinker _main \
     "$source_dir/UsageWidget.swift" "$source_dir/UsageStore.swift" \
+    "$source_dir/QuotaActivityAttributes.swift" "$source_dir/QuotaLiveActivity.swift" \
+    "$source_dir/QuotaWorkProgress.swift" \
     -o "$widget_path/Contents/MacOS/OpenAIUsageWidget"
 
 /usr/bin/codesign --force --sign - --entitlements "$widget_entitlements" "$widget_path"
