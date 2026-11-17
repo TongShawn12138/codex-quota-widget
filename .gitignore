@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+/build/
+.module-cache/
+.usage-build.*/
+*.app/
+*.appex/
+*.dSYM/
+*.xcuserstate
+.env
+.env.*
+usage.json
